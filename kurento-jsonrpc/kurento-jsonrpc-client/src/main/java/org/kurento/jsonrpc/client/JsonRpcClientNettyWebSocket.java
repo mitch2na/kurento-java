@@ -154,13 +154,30 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
   private volatile Channel channel;
   private volatile EventLoopGroup group;
   private volatile JsonRpcWebSocketClientHandler handler;
+  private final boolean channelTimeout;
+  private String host = "";
+  private int port;
 
   public JsonRpcClientNettyWebSocket(String url) {
-    this(url, null);
+    this(url,  null, false);
   }
 
   public JsonRpcClientNettyWebSocket(String url, JsonRpcWSConnectionListener connectionListener) {
+    this(url, connectionListener, false);
+    log.debug("{} Creating JsonRPC NETTY Websocket client", label);
+  }
+
+  /**
+   * Create json rpc client netty websocket connection
+   *
+   * @param url                - url of websocket connection
+   * @param connectionListener - listener
+   * @param channelTimeout     - should use future timeout for channel creation to prevent this thread from blocking forever.
+   */
+  public JsonRpcClientNettyWebSocket(String url, JsonRpcWSConnectionListener connectionListener,
+                                     boolean channelTimeout) {
     super(url, connectionListener);
+    this.channelTimeout = channelTimeout;
     log.debug("{} Creating JsonRPC NETTY Websocket client", label);
   }
 
@@ -215,7 +232,8 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
       } else {
         port = uri.getPort();
       }
-
+      this.port = port;
+      this.host = host;
       if (group == null || group.isShuttingDown() || group.isShutdown() || group.isTerminated()) {
         log.info("{} Creating new NioEventLoopGroup", label);
         group = new NioEventLoopGroup();
@@ -250,13 +268,26 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
       final int maxRetries = 5;
       while (channel == null || !channel.isOpen()) {
         try {
-          channel = b.connect(host, port).sync().channel();
-          handler.handshakeFuture().sync();
+          ChannelFuture future = b.connect(host, port);
+          if (channelTimeout) {
+            handleChannelFutureTimeout(future);
+            this.channel = future.channel();
+          } else {
+            channel = future.sync().channel();
+          }
+          future = handler.handshakeFuture();
+          if (channelTimeout) {
+            handleChannelFutureTimeout(future);
+          } else {
+            future.sync();
+          }
         } catch (InterruptedException e) {
           // This should never happen
           log.warn("{} ERROR connecting WS Netty client, opening channel", label, e);
         } catch (Exception e) {
-          if (e.getCause() instanceof WebSocketHandshakeException && numRetries < maxRetries) {
+          if (e.getCause() instanceof WebSocketHandshakeException
+                  || e.getCause() instanceof TimeoutException
+                  && numRetries < maxRetries) {
             log.warn(
                 "{} Upgrade exception when trying to connect to {}. Try {} of {}. Retrying in 200ms ",
                 label, uri, numRetries + 1, maxRetries);
@@ -298,7 +329,12 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
     if (channel != null) {
       log.debug("{} Closing client", label);
       try {
-        channel.close().sync();
+        ChannelFuture channelFuture = channel.close();
+        if (channelTimeout) {
+          handleChannelFutureTimeout(channelFuture);
+        } else {
+          channelFuture.sync();
+        }
       } catch (Exception e) {
         log.debug("{} Could not properly close websocket client. Reason: {}", label, e.getMessage(),
             e);
@@ -306,6 +342,23 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
       channel = null;
     } else {
       log.warn("{} Trying to close a JsonRpcClientNettyWebSocket with channel == null", label);
+    }
+  }
+
+  private void handleChannelFutureTimeout(ChannelFuture future) throws Exception {
+    // increase timeout plus 500 milliseconds to add buffer between actual connection timeout
+    final int timeoutMillis = this.connectionTimeout + 500;
+    future.await(timeoutMillis);
+    if (!future.isDone()) {
+      future.cancel(true);
+      throw new TimeoutException("Connection to " + host + ":" + port + " with future timeout of " + timeoutMillis);
+    }
+    if (future.isCancelled()) {
+      throw new Exception("Connection to " + host + ":" + port + " cancelled by user!");
+    }
+    if (!future.isSuccess()) {
+      final Throwable cause = future.cause();
+      throw new Exception("Create connection to " + host + ":" + port + " error", cause);
     }
   }
 
